@@ -65,7 +65,7 @@ def main():
     print_memory_usage(local_rank)
 
     # Initialize ModelManager directly on GPU to avoid CPU tensors
-    model_manager = ModelManager(device="cuda")
+    model_manager = ModelManager(device="cuda", torch_dtype=torch.float16)
 
     # Load models from checkpoint directory
     if local_rank == 0:
