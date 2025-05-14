@@ -7,6 +7,9 @@ from diffsynth.models import ModelManager
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import CPUOffload
 
+# Set memory allocation strategy
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate photorealistic video with Wan2.1-T2V-14B")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt for video generation")
@@ -64,8 +67,9 @@ def main():
     # Print initial memory usage
     print_memory_usage(local_rank)
 
-    # Initialize ModelManager directly on GPU to avoid CPU tensors
-    model_manager = ModelManager(device="cuda", torch_dtype=torch.float16)
+    # Initialize ModelManager with CPU offloading if specified
+    device = "cpu" if args.offload_model else "cuda"
+    model_manager = ModelManager(device=device, torch_dtype=torch.float16)
 
     # Load models from checkpoint directory
     if local_rank == 0:
@@ -101,21 +105,28 @@ def main():
         print(f"Debug: Loading models with paths: {model_paths}")
 
     try:
+        # Load models one at a time to better manage memory
         if diffusion_files:
             if local_rank == 0:
                 print("Debug: Loading diffusion models...")
             model_manager.load_models([diffusion_files], torch_dtype=torch.float16)
             print_memory_usage(local_rank)
+            torch.cuda.empty_cache()  # Clear cache after each model load
+
         if t5_file:
             if local_rank == 0:
                 print("Debug: Loading T5 model...")
             model_manager.load_models([t5_file], torch_dtype=torch.float16)
             print_memory_usage(local_rank)
+            torch.cuda.empty_cache()
+
         if vae_file:
             if local_rank == 0:
                 print("Debug: Loading VAE model...")
             model_manager.load_models([vae_file], torch_dtype=torch.float16)
             print_memory_usage(local_rank)
+            torch.cuda.empty_cache()
+
     except Exception as e:
         if local_rank == 0:
             print(f"Error loading models: {e}")
@@ -133,20 +144,21 @@ def main():
     )
     print_memory_usage(local_rank)
 
-    # Skip VRAM management and offloading since we want everything on GPU
-    if local_rank == 0:
-        print("Debug: Skipping CPU offloading, keeping everything on GPU.")
-    print_memory_usage(local_rank)
+    # Configure FSDP with CPU offloading if specified
+    fsdp_config = {
+        "device_id": torch.cuda.current_device(),
+        "cpu_offload": CPUOffload(offload_params=True) if args.offload_model else None
+    }
 
-    # Wrap models with FSDP without CPU offloading, specify device_id for GPU initialization
+    # Wrap models with FSDP
     if hasattr(pipeline, 'dit'):
         if local_rank == 0:
-            print("Debug: Wrapping dit with FSDP without CPU offloading...")
-        pipeline.dit = FSDP(pipeline.dit, device_id=torch.cuda.current_device())
+            print("Debug: Wrapping dit with FSDP...")
+        pipeline.dit = FSDP(pipeline.dit, **fsdp_config)
     if hasattr(pipeline, 'text_encoder'):
         if local_rank == 0:
-            print("Debug: Wrapping text_encoder with FSDP without CPU offloading...")
-        pipeline.text_encoder = FSDP(pipeline.text_encoder, device_id=torch.cuda.current_device())
+            print("Debug: Wrapping text_encoder with FSDP...")
+        pipeline.text_encoder = FSDP(pipeline.text_encoder, **fsdp_config)
     print_memory_usage(local_rank)
 
     # Ensure all components are on GPU (should be redundant but added for safety)
@@ -172,7 +184,7 @@ def main():
                 width=args.width,
                 height=args.height,
                 num_frames=args.num_frames,
-                fps=args.fps,  # Ensure fps is passed correctly
+                fps=args.fps,
                 num_inference_steps=args.num_inference_steps,
                 sample_guide_scale=args.sample_guide_scale,
                 sample_shift=args.sample_shift,
